@@ -120,6 +120,7 @@ import {
 } from '@posthog/core'
 import { uuidv7 } from '@posthog/browser-common/utils/uuidv7'
 import { ExternalIntegrations } from './extensions/external-integration'
+import { BrowserExtensionHost } from './extensions/browser-client'
 import type { PostHogSurveys } from './posthog-surveys'
 import type { Autocapture } from './autocapture'
 import type { DeadClicksAutocapture } from './extensions/dead-clicks-autocapture'
@@ -457,6 +458,8 @@ export class PostHog implements PostHogInterface {
     _internalEventEmitter = new SimpleEventEmitter()
 
     private readonly _extensions: Extension[] = []
+    private readonly _extensionEventPropertyProducers: Array<() => Record<string, unknown>> = []
+    private _browserExtensionHost: BrowserExtensionHost | undefined
 
     private _replaceExtension<T extends Extension>(oldExt: T | undefined, newExt: T): T {
         if (oldExt) {
@@ -949,8 +952,8 @@ export class PostHog implements PostHogInterface {
         initTasks.push(() => {
             if (this._pendingRemoteConfig) {
                 const result = this._pendingRemoteConfig
-                this._pendingRemoteConfig = undefined // Clear before replaying to avoid re-storing
-                this._onRemoteConfig(result)
+                this._pendingRemoteConfig = undefined
+                this._applyRemoteConfig(result)
             }
         })
 
@@ -1004,25 +1007,27 @@ export class PostHog implements PostHogInterface {
     }
 
     _onRemoteConfig(result: RemoteConfigResult) {
+        // Cache and publish before waiting for the DOM. Shared extensions do not
+        // depend on document.body, and body retries must not emit the same result twice.
+        this._lastRemoteConfig = result
+        this._browserExtensionHost?.handleRemoteConfig(result)
+
+        this._applyRemoteConfig(result)
+    }
+
+    private _applyRemoteConfig(result: RemoteConfigResult): void {
         if (!(document && document.body)) {
             logger.info('document not ready yet, trying again in 500 milliseconds...')
             setTimeout(() => {
-                this._onRemoteConfig(result)
+                this._applyRemoteConfig(result)
             }, 500)
             return
         }
 
-        // Store config in case extensions aren't initialized yet (only needed for deferred init)
+        // Store config in case legacy extensions aren't initialized yet (only needed for deferred init).
         if (this.config.__preview_deferred_init_extensions) {
             this._pendingRemoteConfig = result
         }
-
-        // Cache the latest remote config result so extensions that are created later
-        // (e.g. sessionRecording after opt_in_capturing from cookieless mode) can
-        // replay it and pick up server-side settings like recording enable flags.
-        // Storing the result (not just a config) means a replayed failure is
-        // distinguishable from a successful empty config.
-        this._lastRemoteConfig = result
 
         this.compression = undefined
         if (result.ok) {
@@ -1354,6 +1359,18 @@ export class PostHog implements PostHogInterface {
             return
         }
 
+        if (this._extensionEventPropertyProducers.length > 0) {
+            const dynamicProperties: Properties = {}
+            for (const producer of this._extensionEventPropertyProducers.slice()) {
+                try {
+                    extend(dynamicProperties, producer() as Properties)
+                } catch (error) {
+                    logger.error('Failed to produce browser extension event properties', error)
+                }
+            }
+            properties = { ...dynamicProperties, ...(properties ?? {}) }
+        }
+
         if (properties?.$current_url && !isString(properties?.$current_url)) {
             logger.error(
                 'Invalid `$current_url` property provided to `posthog.capture`. Input must be a string. Ignoring provided value.'
@@ -1525,6 +1542,25 @@ export class PostHog implements PostHogInterface {
 
     _addCaptureHook(callback: (eventName: string, eventPayload?: CaptureResult) => void): () => void {
         return this.on('eventCaptured', (data) => callback(data.event, data))
+    }
+
+    _getBrowserExtensionHost(): BrowserExtensionHost {
+        return (this._browserExtensionHost ??= new BrowserExtensionHost(this))
+    }
+
+    _registerExtensionEventProperties(producer: () => Record<string, unknown>): () => void {
+        this._extensionEventPropertyProducers.push(producer)
+        let active = true
+        return () => {
+            if (!active) {
+                return
+            }
+            active = false
+            const index = this._extensionEventPropertyProducers.indexOf(producer)
+            if (index !== -1) {
+                this._extensionEventPropertyProducers.splice(index, 1)
+            }
+        }
     }
 
     /**
@@ -3019,6 +3055,7 @@ export class PostHog implements PostHogInterface {
         this.logs?.reset()
         this.metrics?.reset()
         this.persistence?.set_property(USER_STATE, USER_STATE_ANONYMOUS)
+        this._browserExtensionHost?.markReset()
         this.sessionManager?.resetSessionId()
         this._cachedPersonProperties = null
         if (this.config.cookieless_mode === COOKIELESS_ALWAYS) {
@@ -3091,6 +3128,10 @@ export class PostHog implements PostHogInterface {
             logger.uninitializedWarning('posthog.shutdown')
             return
         }
+
+        // Shared extensions can perform final async work during disposal. Complete
+        // that work before unloading the queues so any final captures can still send.
+        await this._browserExtensionHost?.dispose()
 
         // Best-effort flush of anything still queued, mirroring page-unload teardown
         // so no buffered events are silently dropped when teardown is explicit.
