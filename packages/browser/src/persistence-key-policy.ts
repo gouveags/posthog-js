@@ -1,7 +1,6 @@
 import {
     ALIAS_ID_KEY,
     AUTOCAPTURE_DISABLED_SERVER_SIDE,
-    BROWSER_EXTENSION_KV_PREFIX,
     CAMPAIGN_IDS_KEY,
     CAPTURE_RATE_LIMIT,
     CLIENT_SESSION_PROPS,
@@ -194,7 +193,6 @@ export const PERSISTENCE_KEY_POLICY: Record<string, PersistenceKeyPolicyEntry> =
 }
 
 const PERSISTENCE_KEY_PREFIX_POLICY: Array<[string, PersistenceKeyPolicyEntry]> = [
-    [BROWSER_EXTENSION_KV_PREFIX, { exposure: 'hidden' }],
     [SESSION_RECORDING_TRIGGER_V2_GROUP_EVENT_PREFIX, { exposure: 'hidden' }],
     [SESSION_RECORDING_TRIGGER_V2_GROUP_URL_PREFIX, { exposure: 'hidden' }],
     [SESSION_RECORDING_TRIGGER_V2_GROUP_SAMPLING_PREFIX, { exposure: 'hidden' }],

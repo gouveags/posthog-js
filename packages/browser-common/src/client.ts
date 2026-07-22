@@ -1,4 +1,5 @@
 import type { Logger } from '@posthog/core'
+import type { Properties } from '@posthog/types'
 
 import type { Disposable } from './disposable'
 import type { KeyValueStore } from './persistence'
@@ -46,14 +47,14 @@ export interface CaptureOptions {
 
 /** A minimal response from {@link Client.apiRequest}. */
 export interface ApiResponse {
-    /** Whether the request completed with a 2xx status, or was queued for best-effort unload transport. */
-    ok: boolean
     /** The HTTP status code returned by the transport, or a client-defined best-effort status for unload sends. */
-    status: number
-    /** Parse the response body as JSON; may be unavailable for best-effort unload requests. */
-    json(): Promise<unknown>
-    /** Read the response body as text; may be unavailable for best-effort unload requests. */
-    text(): Promise<string>
+    statusCode: number
+    /** The response body parsed as JSON when available. */
+    json?: unknown
+    /** The response body as text when available. */
+    text?: string
+    /** The transport error when the request failed before receiving an HTTP response. */
+    error?: unknown
 }
 
 /** Options for sending a request through {@link Client.apiRequest}. */
@@ -67,8 +68,8 @@ export interface ApiRequestInit {
     /**
      * Mark this as a teardown send (pagehide / shutdown): the client picks the
      * most reliable fire-and-forget transport available — `sendBeacon`, fetch
-     * `keepalive`, or sync XHR. The response is best-effort: `.json()` may be
-     * unusable (e.g. `sendBeacon` only reports "queued"), so callers must not
+     * `keepalive`, or sync XHR. The response is best-effort: `json` may be
+     * unavailable (e.g. `sendBeacon` only reports "queued"), so callers must not
      * depend on it.
      */
     unload?: boolean
@@ -88,9 +89,9 @@ export type RemoteConfig = Record<string, unknown>
  * extension is handed in `setup`. Each SDK (v1, v2) provides it as a client
  * adapter over its own internals.
  *
- * Synchronous members are always-ready in-memory reads (identity, session);
- * asynchronous members do I/O or wait for something to become ready
- * (`capture`, `apiRequest`, `kv`, `getRemoteConfig`).
+ * Synchronous members are always-ready in-memory reads (identity, session).
+ * Operations that may do I/O are awaitable; a host can complete them
+ * synchronously when its underlying storage supports that.
  */
 export interface Client {
     /** The id events are currently attributed to — the anonymous id, or the identified user's id after `identify`. */
@@ -103,7 +104,7 @@ export interface Client {
     readonly session: SessionContext
 
     /** Records an analytics event through the client's normal pipeline. */
-    capture(event: string, properties?: Record<string, unknown> | null, options?: CaptureOptions): Promise<void>
+    capture(event: string, properties?: Properties | null, options?: CaptureOptions): Promise<void>
 
     /**
      * Registers a producer of properties merged into every captured event.
@@ -146,7 +147,7 @@ export interface Client {
      */
     getExtension<T>(token: ExtensionToken<T>): T | undefined
 
-    /** Async key-value storage scoped to this client instance and extension. */
+    /** Awaitable key-value storage backed by the host client's persistence. */
     readonly kv: KeyValueStore
 
     /** Logger that follows the host client's debug/noise policy. */

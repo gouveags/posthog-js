@@ -1,4 +1,5 @@
 import { isNull, isUndefined, type Logger } from '@posthog/core'
+import type { Properties } from '@posthog/types'
 
 import type {
     ApiRequestInit,
@@ -69,16 +70,7 @@ const noopLogger: Logger = {
 }
 
 function createDefaultApiResponse(): ApiResponse {
-    return {
-        ok: true,
-        status: 200,
-        async json() {
-            return undefined
-        },
-        async text() {
-            return ''
-        },
-    }
+    return { statusCode: 200 }
 }
 
 export class TestClient implements Client {
@@ -118,7 +110,7 @@ export class TestClient implements Client {
         this._apiResponse = options.apiResponse ?? createDefaultApiResponse()
     }
 
-    async capture(event: string, properties?: Record<string, unknown> | null, options?: CaptureOptions): Promise<void> {
+    async capture(event: string, properties?: Properties | null, options?: CaptureOptions): Promise<void> {
         const dynamicProperties = this._dynamicEventPropertyProducers.reduce(
             (acc, producer) => ({ ...acc, ...producer() }),
             {} as Record<string, unknown>

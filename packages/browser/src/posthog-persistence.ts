@@ -2,7 +2,7 @@
 
 import { each, extend, stripEmptyProperties, addEventListener } from '@posthog/browser-common/utils/general-utils'
 import { cookieStore, createLocalPlusCookieStore, localStore, memoryStore, sessionStore } from './storage'
-import { PersistentStore, PostHogConfig, Properties, Property } from './types'
+import { PersistentStore, PostHogConfig, Properties } from './types'
 import { window } from '@posthog/browser-common/utils/globals'
 import {
     ENABLED_FEATURE_FLAGS,
@@ -708,14 +708,6 @@ export class PostHogPersistence {
             this._deleteProp(prop)
             this.save()
         }
-    }
-
-    _registerExtensionValue(prop: string, value: Property): void {
-        this.register({ [prop]: value })
-    }
-
-    _unregisterExtensionValue(prop: string): void {
-        this.unregister(prop)
     }
 
     update_campaign_params(): void {

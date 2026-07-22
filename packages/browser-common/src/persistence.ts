@@ -1,11 +1,10 @@
 /**
- * Async key-value store for small extension state. Backed by whatever the
- * client provides — a synchronous store resolves immediately, an asynchronous
- * one (e.g. IndexedDB) does real I/O — so reads and writes are always awaited.
+ * Key-value store for small extension state. Implementations backed by
+ * synchronous persistence may return immediately, while asynchronous stores
+ * (for example IndexedDB) may return promises. Consumers can await either.
  *
- * The store is namespaced to the client instance, so keys are local to the
- * extension and never collide with core SDK state. Values must be
- * JSON-serializable; setting `null`/`undefined` removes the key.
+ * Keys map to the host client's persistence keys. Values must be
+ * JSON-serializable.
  */
 export interface KeyValueStore {
     /**
@@ -13,12 +12,9 @@ export interface KeyValueStore {
      *
      * @returns The stored value, or `undefined` when the key is missing.
      */
-    get<T = unknown>(key: string): Promise<T | undefined>
-    /**
-     * Store a JSON-serializable value by key. Passing `null` or `undefined`
-     * removes the key instead of persisting that value.
-     */
-    set(key: string, value: unknown): Promise<void>
-    /** Remove a value by key. Resolves successfully when the key is already absent. */
-    remove(key: string): Promise<void>
+    get<T = unknown>(key: string): T | undefined | Promise<T | undefined>
+    /** Store a JSON-serializable value by key. */
+    set(key: string, value: unknown): void | Promise<void>
+    /** Remove a value by key. */
+    remove(key: string): void | Promise<void>
 }

@@ -15,13 +15,11 @@ import type {
     RemoteConfig as BrowserCommonRemoteConfig,
     SessionContext,
 } from '@posthog/browser-common'
-import { Publisher } from '@posthog/browser-common'
-import { isNullish, isUndefined } from '@posthog/core'
 import type { Logger } from '@posthog/core'
 import { logger } from '@posthog/browser-common/utils/logger'
-import { formDataToQuery, getQueryParam } from '@posthog/browser-common/utils/request-utils'
 
-import { BROWSER_EXTENSION_KV_PREFIX, DEVICE_ID } from '../constants'
+import { DEVICE_ID } from '../constants'
+import { extendURLParams } from '../request'
 import type { PostHog } from '../posthog-core'
 import type {
     CaptureOptions,
@@ -32,70 +30,25 @@ import type {
     RemoteConfigResult,
 } from '../types'
 
-export interface BrowserExtensionRegistrationOptions {
-    /** Map an extension-local key to an existing v1 persistence key. */
-    kvAliases?: Record<string, string>
-}
-
 interface RegisteredExtension {
     extension: Extension
-    adapter: BrowserClientAdapter
     setupPromise: Promise<void>
     disposalPromise?: Promise<void>
 }
 
 class BrowserExtensionKeyValueStore implements KeyValueStore {
-    private readonly _memory = new Map<string, unknown>()
+    constructor(private readonly _instance: PostHog) {}
 
-    constructor(
-        private readonly _instance: PostHog,
-        private readonly _extensionName: string,
-        private readonly _aliases: Record<string, string>
-    ) {}
-
-    private _persistenceKey(key: string): string {
-        return Object.prototype.hasOwnProperty.call(this._aliases, key)
-            ? this._aliases[key]
-            : `${BROWSER_EXTENSION_KV_PREFIX}${encodeURIComponent(this._extensionName)}/${encodeURIComponent(key)}`
+    get<T = unknown>(key: string): T | undefined {
+        return this._instance.persistence?.props[key] as T | undefined
     }
 
-    async get<T = unknown>(key: string): Promise<T | undefined> {
-        const persistenceKey = this._persistenceKey(key)
-        const persistence = this._instance.persistence
-        if (!persistence) {
-            return this._memory.get(persistenceKey) as T | undefined
-        }
-
-        if (this._memory.has(persistenceKey)) {
-            const memoryValue = this._memory.get(persistenceKey) as Property
-            this._memory.delete(persistenceKey)
-            if (isUndefined(persistence.props[persistenceKey])) {
-                persistence._registerExtensionValue(persistenceKey, memoryValue)
-            }
-        }
-        return persistence.props[persistenceKey] as T | undefined
+    set(key: string, value: unknown): void {
+        this._instance.persistence?.register({ [key]: value as Property })
     }
 
-    async set(key: string, value: unknown): Promise<void> {
-        const persistenceKey = this._persistenceKey(key)
-        if (isNullish(value)) {
-            await this.remove(key)
-            return
-        }
-
-        const persistence = this._instance.persistence
-        if (persistence) {
-            this._memory.delete(persistenceKey)
-            persistence._registerExtensionValue(persistenceKey, value as Property)
-        } else {
-            this._memory.set(persistenceKey, value)
-        }
-    }
-
-    async remove(key: string): Promise<void> {
-        const persistenceKey = this._persistenceKey(key)
-        this._memory.delete(persistenceKey)
-        this._instance.persistence?._unregisterExtensionValue(persistenceKey)
+    remove(key: string): void {
+        this._instance.persistence?.unregister(key)
     }
 }
 
@@ -112,53 +65,18 @@ function disposable(dispose: () => void): Disposable {
     }
 }
 
-function appendRequestQuery(instance: PostHog, path: string, query: Record<string, string> | undefined): string {
-    const target = /^\/?flags(?:\/|\?|$)/.test(path) ? 'flags' : 'api'
-    const url = instance.requestRouter.endpointFor(target, path)
-    const appendedQuery = { ...query }
-    if (getQueryParam(url, 'token')) {
-        delete appendedQuery.token
-    } else if (!appendedQuery.token) {
-        appendedQuery.token = instance.config.token
-    }
-    const queryString = formDataToQuery(appendedQuery)
-
-    return queryString ? `${url}${url.indexOf('?') === -1 ? '?' : '&'}${queryString}` : url
-}
-
-function apiResponse(status: number, response?: { json?: unknown; text?: string }): ApiResponse {
-    return {
-        ok: status >= 200 && status < 300,
-        status,
-        async json(): Promise<unknown> {
-            if (!isUndefined(response?.json)) {
-                return response.json
-            }
-            if (response?.text) {
-                return JSON.parse(response.text)
-            }
-            return undefined
-        },
-        async text(): Promise<string> {
-            if (!isUndefined(response?.text)) {
-                return response.text
-            }
-            return isUndefined(response?.json) ? '' : JSON.stringify(response.json)
-        },
-    }
-}
+const REMOTE_CONFIG_EVENT = 'extensionsRemoteConfig'
+const NEW_SESSION_EVENT = 'extensionsNewSession'
 
 /**
  * One browser-v1 host per PostHog instance. It owns shared extension lifecycle,
  * capability registration, and event streams while each extension receives a
- * separately namespaced Client adapter.
+ * Client adapter.
  */
 export class BrowserExtensionHost implements Disposable {
     private readonly _extensions = new Map<string, RegisteredExtension>()
     private readonly _registrationOrder: RegisteredExtension[] = []
     private readonly _providers = new Map<ExtensionToken<unknown>, unknown>()
-    private readonly _remoteConfigPublisher = new Publisher<BrowserCommonRemoteConfig>()
-    private readonly _newSessionPublisher = new Publisher<NewSessionInfo>()
     private readonly _remoteConfigWaiters: Array<(config: BrowserCommonRemoteConfig | undefined) => void> = []
     private readonly _logger: Logger
     private _latestRemoteConfigResult: RemoteConfigResult | undefined
@@ -178,14 +96,14 @@ export class BrowserExtensionHost implements Disposable {
     }
 
     get onRemoteConfig(): Listener<BrowserCommonRemoteConfig> {
-        return this._remoteConfigPublisher.listener
+        return (handler) => disposable(this.instance._internalEventEmitter.on(REMOTE_CONFIG_EVENT, handler))
     }
 
     get onNewSession(): Listener<NewSessionInfo> {
-        return this._newSessionPublisher.listener
+        return (handler) => disposable(this.instance._internalEventEmitter.on(NEW_SESSION_EVENT, handler))
     }
 
-    add(extension: Extension, options: BrowserExtensionRegistrationOptions = {}): void {
+    add(extension: Extension): void {
         if (this._disposed) {
             throw new Error('Cannot add an extension to a disposed BrowserExtensionHost')
         }
@@ -199,8 +117,8 @@ export class BrowserExtensionHost implements Disposable {
             }
         }
 
-        const adapter = new BrowserClientAdapter(this, extension.name, options.kvAliases ?? {})
-        const registered = { extension, adapter, setupPromise: Promise.resolve() } satisfies RegisteredExtension
+        const adapter = new BrowserClientAdapter(this, extension.name)
+        const registered = { extension, setupPromise: Promise.resolve() } satisfies RegisteredExtension
         this._extensions.set(extension.name, registered)
         this._registrationOrder.push(registered)
         for (const token of extension.provides ?? []) {
@@ -233,7 +151,7 @@ export class BrowserExtensionHost implements Disposable {
         const config = result.ok ? (result.config as unknown as BrowserCommonRemoteConfig) : undefined
         this._remoteConfigWaiters.splice(0).forEach((resolve) => resolve(config))
         if (config) {
-            this._remoteConfigPublisher.publish(config)
+            this.instance._internalEventEmitter.emit(REMOTE_CONFIG_EVENT, config)
         }
     }
 
@@ -273,8 +191,8 @@ export class BrowserExtensionHost implements Disposable {
         this._providers.clear()
         this._removeSessionListener?.()
         this._removeSessionListener = undefined
-        this._remoteConfigPublisher.dispose()
-        this._newSessionPublisher.dispose()
+        this.instance._internalEventEmitter.clear(REMOTE_CONFIG_EVENT)
+        this.instance._internalEventEmitter.clear(NEW_SESSION_EVENT)
     }
 
     private async _handleSetupFailure(registered: RegisteredExtension, error: unknown): Promise<void> {
@@ -335,7 +253,7 @@ export class BrowserExtensionHost implements Disposable {
             }
 
             const current = this._sessionContext(sessionId, windowId ?? '')
-            this._newSessionPublisher.publish({ ...current, reason })
+            this.instance._internalEventEmitter.emit(NEW_SESSION_EVENT, { ...current, reason })
         })
     }
 
@@ -370,10 +288,9 @@ export class BrowserClientAdapter implements Client {
 
     constructor(
         private readonly _host: BrowserExtensionHost,
-        extensionName: string,
-        kvAliases: Record<string, string>
+        extensionName: string
     ) {
-        this.kv = new BrowserExtensionKeyValueStore(_host.instance, extensionName, kvAliases)
+        this.kv = new BrowserExtensionKeyValueStore(_host.instance)
         this.logger = _host.logger.createLogger(`[${extensionName}]`)
         this.onRemoteConfig = _host.onRemoteConfig
         this.onNewSession = _host.onNewSession
@@ -395,18 +312,14 @@ export class BrowserClientAdapter implements Client {
         return this._host.sessionContext()
     }
 
-    async capture(
-        event: string,
-        properties?: Record<string, unknown> | null,
-        options?: BrowserCommonCaptureOptions
-    ): Promise<void> {
+    async capture(event: string, properties?: Properties | null, options?: BrowserCommonCaptureOptions): Promise<void> {
         const captureOptions: CaptureOptions = {
             timestamp: options?.timestamp,
             uuid: options?.uuid,
             $set: options?.set as Properties | undefined,
             $set_once: options?.setOnce as Properties | undefined,
         }
-        this._host.instance.capture(event as EventName, properties as Properties | null | undefined, captureOptions)
+        this._host.instance.capture(event as EventName, properties, captureOptions)
     }
 
     registerDynamicEventProperties(producer: () => Record<string, unknown>): Disposable {
@@ -414,9 +327,13 @@ export class BrowserClientAdapter implements Client {
     }
 
     async apiRequest(path: string, init: ApiRequestInit = {}): Promise<ApiResponse> {
+        const instance = this._host.instance
+        const target = /^\/?flags(?:\/|\?|$)/.test(path) ? 'flags' : 'api'
+        const endpoint = instance.requestRouter.endpointFor(target, path)
+        const query = { ...init.query, token: init.query?.token || instance.config.token }
         const requestOptions: QueuedRequestWithOptions = {
             method: init.method ?? 'POST',
-            url: appendRequestQuery(this._host.instance, path, init.query),
+            url: extendURLParams(endpoint, query, false),
             data: init.body as Record<string, unknown> | undefined,
             timeout: init.timeoutMs,
             noRetries: true,
@@ -426,11 +343,11 @@ export class BrowserClientAdapter implements Client {
 
         if (init.unload) {
             this._host.instance._send_request(requestOptions)
-            return apiResponse(202)
+            return { statusCode: 202 }
         }
 
         return new Promise((resolve) => {
-            requestOptions.callback = (response) => resolve(apiResponse(response.statusCode, response))
+            requestOptions.callback = resolve
             this._host.instance._send_request(requestOptions)
         })
     }

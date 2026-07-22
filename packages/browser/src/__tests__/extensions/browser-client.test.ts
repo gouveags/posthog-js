@@ -1,13 +1,13 @@
 import type { Client, Extension, ExtensionToken, NewSessionInfo } from '@posthog/browser-common'
 
 import { logger } from '@posthog/browser-common/utils/logger'
+import { SimpleEventEmitter } from '@posthog/browser-common/utils/simple-event-emitter'
 
-import { AUTOCAPTURE_DISABLED_SERVER_SIDE, BROWSER_EXTENSION_KV_PREFIX, DEVICE_ID } from '../../constants'
+import { AUTOCAPTURE_DISABLED_SERVER_SIDE, DEVICE_ID } from '../../constants'
 import { BrowserExtensionHost } from '../../extensions/browser-client'
-import { getPersistenceKeyPolicy } from '../../persistence-key-policy'
 import type { PostHog } from '../../posthog-core'
 import type { PostHogPersistence } from '../../posthog-persistence'
-import type { CaptureOptions, Properties, Property, QueuedRequestWithOptions, RemoteConfigResult } from '../../types'
+import type { CaptureOptions, Properties, QueuedRequestWithOptions, RemoteConfigResult } from '../../types'
 import { createPosthogInstance } from '../helpers/posthog-instance'
 
 interface MockPostHog extends PostHog {
@@ -56,8 +56,6 @@ function createMockPostHog(
         props,
         register: jest.fn((values: Properties) => Object.assign(props, values)),
         unregister: jest.fn((key: string) => delete props[key]),
-        _registerExtensionValue: jest.fn((key: string, value: Property) => (props[key] = value)),
-        _unregisterExtensionValue: jest.fn((key: string) => delete props[key]),
     } as unknown as PostHogPersistence
 
     const instance = {
@@ -81,6 +79,7 @@ function createMockPostHog(
             endpointFor: jest.fn((target: string, path: string) => `https://${target}.example.com${path}`),
         },
         _send_request: jest.fn(),
+        _internalEventEmitter: new SimpleEventEmitter(),
         on: jest.fn((_event: string, handler: (event: { event: string; properties: Properties }) => void) => {
             eventHandlers.add(handler)
             return () => eventHandlers.delete(handler)
@@ -163,65 +162,26 @@ describe('BrowserExtensionHost', () => {
         await host.dispose()
     })
 
-    it('namespaces KV keys, supports aliases, removes values, and hides normal keys from events', async () => {
+    it('reads, writes, and removes persistence keys directly', async () => {
         const instance = createMockPostHog()
-        const host = new BrowserExtensionHost(instance)
-        let first: Client | undefined
-        let second: Client | undefined
-        host.add(
-            testExtension('first/extension', (client) => (first = client)),
-            {
-                kvAliases: { legacy: '$legacy-key' },
-            }
-        )
-        host.add(testExtension('second', (client) => (second = client)))
-
-        const firstKey = `${BROWSER_EXTENSION_KV_PREFIX}first%2Fextension/state%20key`
-        const secondKey = `${BROWSER_EXTENSION_KV_PREFIX}second/state%20key`
-        instance.persistence!.props[firstKey] = { prepopulated: true }
-        expect(await first?.kv.get('state key')).toEqual({ prepopulated: true })
-
-        await first?.kv.set('state key', { enabled: true })
-        await second?.kv.set('state key', 'second')
-        await first?.kv.set('legacy', false)
-        await first?.kv.set('toString', 'reserved')
-
-        expect(instance.persistence?.props[firstKey]).toEqual({ enabled: true })
-        expect(instance.persistence?.props[secondKey]).toBe('second')
-        expect(instance.persistence?.props['$legacy-key']).toBe(false)
-        expect(instance.persistence?.props[`${BROWSER_EXTENSION_KV_PREFIX}first%2Fextension/toString`]).toBe('reserved')
-        expect(getPersistenceKeyPolicy(firstKey)?.exposure).toBe('hidden')
-        expect(await first?.kv.get('state key')).toEqual({ enabled: true })
-        expect(await second?.kv.get('state key')).toBe('second')
-
-        instance.persistence!.props[firstKey] = { externallyUpdated: true }
-        expect(await first?.kv.get('state key')).toEqual({ externallyUpdated: true })
-        delete instance.persistence!.props[firstKey]
-        expect(await first?.kv.get('state key')).toBeUndefined()
-
-        await first?.kv.remove('state key')
-        await first?.kv.set('legacy', undefined)
-        expect(instance.persistence?.props[firstKey]).toBeUndefined()
-        expect(instance.persistence?.props['$legacy-key']).toBeUndefined()
-        await host.dispose()
-    })
-
-    it('uses memory only until persistence becomes available', async () => {
-        const instance = createMockPostHog()
-        const persistence = instance.persistence
-        instance.persistence = undefined
         const host = new BrowserExtensionHost(instance)
         let client: Client | undefined
         host.add(testExtension('test', (value) => (client = value)))
 
-        await client?.kv.set('state', 'memory')
-        expect(await client?.kv.get('state')).toBe('memory')
-        instance.persistence = persistence
-        expect(await client?.kv.get('state')).toBe('memory')
-        expect(instance.persistence?.props[`${BROWSER_EXTENSION_KV_PREFIX}test/state`]).toBe('memory')
+        const key = '$extension_state'
+        instance.persistence!.props[key] = { prepopulated: true }
+        expect(client?.kv.get(key)).toEqual({ prepopulated: true })
 
-        instance.persistence!.props[`${BROWSER_EXTENSION_KV_PREFIX}test/state`] = 'persistence'
-        expect(await client?.kv.get('state')).toBe('persistence')
+        expect(client?.kv.set(key, { enabled: true })).toBeUndefined()
+        expect(instance.persistence?.register).toHaveBeenCalledWith({ [key]: { enabled: true } })
+        expect(instance.persistence?.props[key]).toEqual({ enabled: true })
+
+        instance.persistence!.props[key] = { externallyUpdated: true }
+        expect(await client?.kv.get(key)).toEqual({ externallyUpdated: true })
+
+        await client?.kv.remove(key)
+        expect(instance.persistence?.unregister).toHaveBeenCalledWith(key)
+        expect(instance.persistence?.props[key]).toBeUndefined()
         await host.dispose()
     })
 
@@ -403,10 +363,9 @@ describe('BrowserExtensionHost', () => {
             query: { extra: 'value', token: 'duplicate-token' },
             timeoutMs: 321,
         })
-        expect(response.ok).toBe(true)
-        expect(response.status).toBe(201)
-        await expect(response.json()).resolves.toEqual({ created: true })
-        await expect(response.text()).resolves.toBe('{"created":true}')
+        expect(response.statusCode).toBe(201)
+        expect(response.json).toEqual({ created: true })
+        expect(response.text).toBe('{"created":true}')
         expect(instance.requestRouter.endpointFor).toHaveBeenCalledWith(
             'flags',
             '/flags/?existing=yes&token=existing-token'
@@ -424,18 +383,18 @@ describe('BrowserExtensionHost', () => {
         expect(send.mock.calls[0][0].url).toContain('extra=value')
         expect(send.mock.calls[0][0].url?.match(/token=/g)).toHaveLength(1)
 
-        send.mockImplementationOnce((options) => options.callback?.({ statusCode: 0 }))
+        const requestError = new Error('network failure')
+        send.mockImplementationOnce((options) => options.callback?.({ statusCode: 0, error: requestError }))
         const dropped = await client!.apiRequest('/api/surveys/')
-        expect(dropped.ok).toBe(false)
-        expect(dropped.status).toBe(0)
+        expect(dropped.statusCode).toBe(0)
+        expect(dropped.error).toBe(requestError)
         expect(send.mock.calls[1][0].url).toContain('token=test-token')
 
         send.mockImplementationOnce(() => undefined)
         const unload = await client!.apiRequest('/s/', { method: 'POST', body: { events: [] }, unload: true })
-        expect(unload.ok).toBe(true)
-        expect(unload.status).toBe(202)
-        await expect(unload.json()).resolves.toBeUndefined()
-        await expect(unload.text()).resolves.toBe('')
+        expect(unload.statusCode).toBe(202)
+        expect(unload.json).toBeUndefined()
+        expect(unload.text).toBeUndefined()
         expect(send.mock.calls.at(-1)?.[0]).toEqual(
             expect.objectContaining({ transport: 'sendBeacon', data: { events: [] } })
         )
@@ -480,7 +439,7 @@ describe('BrowserExtensionHost', () => {
         expect(() => host.add(testExtension('late', jest.fn()))).toThrow('disposed')
     })
 
-    it('keeps namespaced KV hidden while preserving an alias existing event policy', async () => {
+    it('uses the existing persistence policy for direct keys', async () => {
         const captured: Properties[] = []
         const posthog = await createPosthogInstance(undefined, {
             before_send: (event) => {
@@ -491,16 +450,11 @@ describe('BrowserExtensionHost', () => {
             },
         })
         let client: Client | undefined
-        posthog._getBrowserExtensionHost().add(
-            testExtension('test', (value) => (client = value)),
-            { kvAliases: { legacy: AUTOCAPTURE_DISABLED_SERVER_SIDE } }
-        )
+        posthog._getBrowserExtensionHost().add(testExtension('test', (value) => (client = value)))
 
-        await client?.kv.set('state', 'hidden-value')
-        await client?.kv.set('legacy', false)
+        await client?.kv.set(AUTOCAPTURE_DISABLED_SERVER_SIDE, false)
         posthog.capture('kv-exposure')
 
-        expect(captured.at(-1)).not.toHaveProperty(`${BROWSER_EXTENSION_KV_PREFIX}test/state`)
         expect(captured.at(-1)).toHaveProperty(AUTOCAPTURE_DISABLED_SERVER_SIDE, false)
         await posthog.shutdown()
     })
@@ -510,12 +464,7 @@ describe('BrowserExtensionHost', () => {
         const host = posthog._getBrowserExtensionHost()
         const extensionDispose = jest.fn()
         let client: Client | undefined
-        host.add(
-            testExtension('lifecycle', (value) => (client = value), extensionDispose),
-            {
-                kvAliases: { legacy: AUTOCAPTURE_DISABLED_SERVER_SIDE },
-            }
-        )
+        host.add(testExtension('lifecycle', (value) => (client = value), extensionDispose))
         const remoteConfigs: unknown[] = []
         const events: Array<{ event: string; properties: Record<string, unknown> }> = []
         const sessionReasons: string[] = []
@@ -549,10 +498,10 @@ describe('BrowserExtensionHost', () => {
         }
 
         await client?.kv.set('state', 'before-reset')
-        await client?.kv.set('legacy', false)
+        await client?.kv.set(AUTOCAPTURE_DISABLED_SERVER_SIDE, false)
         posthog.reset()
         expect(await client?.kv.get('state')).toBeUndefined()
-        expect(await client?.kv.get('legacy')).toBeUndefined()
+        expect(await client?.kv.get(AUTOCAPTURE_DISABLED_SERVER_SIDE)).toBeUndefined()
         posthog.capture('after-reset')
         expect(sessionReasons).toContain('reset')
 

@@ -1024,7 +1024,7 @@ export class PostHog implements PostHogInterface {
             return
         }
 
-        // Store config in case legacy extensions aren't initialized yet (only needed for deferred init).
+        // Store config in case extensions aren't initialized yet (only needed for deferred init)
         if (this.config.__preview_deferred_init_extensions) {
             this._pendingRemoteConfig = result
         }
