@@ -1,16 +1,16 @@
-import { isNull, isUndefined, type Logger } from '@posthog/core'
+import type { Logger } from '@posthog/core'
 import type { Properties } from '@posthog/types'
 
+import type { ApiRequestInit, ApiResponse, Client } from '../../src/client'
+import { CoreExtension as CoreExtensionToken } from '../../src/core-extension'
 import type {
-    ApiRequestInit,
-    ApiResponse,
     CaptureOptions,
     CapturedEventInfo,
-    Client,
+    CoreExtension,
     NewSessionInfo,
     RemoteConfig,
     SessionContext,
-} from '../../src/client'
+} from '../../src/core-extension'
 import type { Disposable } from '../../src/disposable'
 import type { KeyValueStore } from '../../src/persistence'
 import { Publisher } from '../../src/pubsub'
@@ -45,11 +45,6 @@ export class InMemoryKeyValueStore implements KeyValueStore {
     }
 
     async set(key: string, value: unknown): Promise<void> {
-        if (isNull(value) || isUndefined(value)) {
-            this._values.delete(key)
-            return
-        }
-
         this._values.set(key, value)
     }
 
@@ -73,11 +68,10 @@ function createDefaultApiResponse(): ApiResponse {
     return { statusCode: 200 }
 }
 
-export class TestClient implements Client {
+export class TestCoreExtension implements CoreExtension {
+    readonly name = 'core'
+    readonly provides = [CoreExtensionToken]
     readonly capturedEvents: TestCapturedEvent[] = []
-    readonly apiRequests: TestApiRequest[] = []
-    readonly kv: KeyValueStore = new InMemoryKeyValueStore()
-    readonly logger: Logger
 
     distinctId: string
     anonymousId: string
@@ -85,16 +79,14 @@ export class TestClient implements Client {
     session: SessionContext
 
     private _remoteConfig: RemoteConfig | undefined
-    private _apiResponse: ApiResponse
     private _dynamicEventPropertyProducers: Array<() => Record<string, unknown>> = []
-    private _extensions = new Map<ExtensionToken<unknown>, unknown>()
-    private _remoteConfigPublisher = new Publisher<RemoteConfig>()
     private _eventPublisher = new Publisher<CapturedEventInfo>()
     private _newSessionPublisher = new Publisher<NewSessionInfo>()
+    private _remoteConfigPublisher = new Publisher<RemoteConfig>()
 
-    readonly onRemoteConfig = this._remoteConfigPublisher.listener
     readonly onEvent = this._eventPublisher.listener
     readonly onNewSession = this._newSessionPublisher.listener
+    readonly onRemoteConfig = this._remoteConfigPublisher.listener
 
     constructor(options: TestClientOptions = {}) {
         this.distinctId = options.distinctId ?? 'test-distinct-id'
@@ -106,9 +98,9 @@ export class TestClient implements Client {
             sessionStartTimestamp: 0,
         }
         this._remoteConfig = options.remoteConfig
-        this.logger = options.logger ?? noopLogger
-        this._apiResponse = options.apiResponse ?? createDefaultApiResponse()
     }
+
+    setup(): void {}
 
     async capture(event: string, properties?: Properties | null, options?: CaptureOptions): Promise<void> {
         const dynamicProperties = this._dynamicEventPropertyProducers.reduce(
@@ -140,32 +132,8 @@ export class TestClient implements Client {
         }
     }
 
-    async apiRequest(path: string, init?: ApiRequestInit): Promise<ApiResponse> {
-        this.apiRequests.push({ path, init })
-        return this._apiResponse
-    }
-
     async getRemoteConfig(): Promise<RemoteConfig | undefined> {
         return this._remoteConfig
-    }
-
-    getExtension<T>(token: ExtensionToken<T>): T | undefined {
-        return this._extensions.get(token as ExtensionToken<unknown>) as T | undefined
-    }
-
-    registerExtension<T>(token: ExtensionToken<T>, extension: T): Disposable {
-        this._extensions.set(token as ExtensionToken<unknown>, extension)
-
-        let isActive = true
-        return {
-            dispose: () => {
-                if (!isActive) {
-                    return
-                }
-                isActive = false
-                this._extensions.delete(token as ExtensionToken<unknown>)
-            },
-        }
     }
 
     setRemoteConfig(remoteConfig: RemoteConfig): void {
@@ -187,11 +155,72 @@ export class TestClient implements Client {
     }
 
     dispose(): void {
-        this._remoteConfigPublisher.dispose()
         this._eventPublisher.dispose()
         this._newSessionPublisher.dispose()
-        this._extensions.clear()
+        this._remoteConfigPublisher.dispose()
         this._dynamicEventPropertyProducers = []
+    }
+}
+
+export class TestClient implements Client {
+    readonly apiRequests: TestApiRequest[] = []
+    readonly core: TestCoreExtension
+    readonly kv: KeyValueStore = new InMemoryKeyValueStore()
+    readonly logger: Logger
+
+    private _apiResponse: ApiResponse
+    private _extensions = new Map<string, unknown>()
+
+    constructor(options: TestClientOptions = {}) {
+        this.core = new TestCoreExtension(options)
+        this._extensions.set(CoreExtensionToken, this.core)
+        this.logger = options.logger ?? noopLogger
+        this._apiResponse = options.apiResponse ?? createDefaultApiResponse()
+    }
+
+    get capturedEvents(): TestCapturedEvent[] {
+        return this.core.capturedEvents
+    }
+
+    async apiRequest(path: string, init?: ApiRequestInit): Promise<ApiResponse> {
+        this.apiRequests.push({ path, init })
+        return this._apiResponse
+    }
+
+    getExtension<T>(token: ExtensionToken<T>): T | undefined {
+        return this._extensions.get(token) as T | undefined
+    }
+
+    registerExtension<T>(token: ExtensionToken<T>, extension: T): Disposable {
+        this._extensions.set(token, extension)
+
+        let isActive = true
+        return {
+            dispose: () => {
+                if (!isActive) {
+                    return
+                }
+                isActive = false
+                this._extensions.delete(token)
+            },
+        }
+    }
+
+    setRemoteConfig(remoteConfig: RemoteConfig): void {
+        this.core.setRemoteConfig(remoteConfig)
+    }
+
+    publishEvent(event: string, properties: Record<string, unknown> = {}): void {
+        this.core.publishEvent(event, properties)
+    }
+
+    startNewSession(session: NewSessionInfo): void {
+        this.core.startNewSession(session)
+    }
+
+    dispose(): void {
+        this.core.dispose()
+        this._extensions.clear()
     }
 }
 

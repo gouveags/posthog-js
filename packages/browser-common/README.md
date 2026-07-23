@@ -6,16 +6,17 @@ runtime, but it is not a public API surface and does not provide compatibility
 guarantees outside PostHog SDK packages.
 
 The shared extension contract includes the interface an extension implements
-(`Extension`), the host capabilities it is handed (`Client`), and small shared
-runtime primitives such as `Publisher`.
+(`Extension`), the host services it is handed (`Client`), the core analytics
+capability (`CoreExtension`), and small shared runtime primitives such as
+`Publisher`.
 
-An extension written against this contract runs unchanged across major versions of the web SDK:
+This contract is designed so an extension can run unchanged across major
+versions of the web SDK. The current host adapter is owned by `posthog-js` v1;
+a browser-v2 adapter and the first product-extension composition and loading
+integration are separate work.
 
-- **v1** is synchronous; extensions are registered statically.
-- **v2** is asynchronous; extensions are loaded dynamically.
-
-Each SDK provides a _client adapter_ that implements `Client` over its own
-internals, so extension code never depends on a specific SDK.
+A conforming SDK provides a _client adapter_ that implements `Client` over its
+own internals, so extension code never depends on a specific SDK.
 
 ## Concepts
 
@@ -24,7 +25,7 @@ internals, so extension code never depends on a specific SDK.
 What you implement. The host calls only `setup` and `dispose`:
 
 ```ts
-import type { Disposable, Extension } from '@posthog/browser-common'
+import { CoreExtension, type Disposable, type Extension } from '@posthog/browser-common'
 
 export function webContext(): Extension {
     let removeProperties: Disposable | undefined
@@ -32,7 +33,11 @@ export function webContext(): Extension {
     return {
         name: 'webContext',
         setup(client) {
-            removeProperties = client.registerDynamicEventProperties(() => ({
+            const core = client.getExtension(CoreExtension)
+            if (!core) {
+                throw new Error('CoreExtension is required')
+            }
+            removeProperties = core.registerDynamicEventProperties(() => ({
                 $current_url: window.location.href,
             }))
         },
@@ -52,19 +57,26 @@ and disposed in `dispose()`.
 
 ### `Client`
 
-What an extension is given in `setup` — the host's capability surface:
+What an extension is given in `setup` — the host's extension services:
 
-- **identity & session** (synchronous reads): `distinctId`, `anonymousId`, `groups`, `session`
-- **events**: `capture(...)`, `registerDynamicEventProperties(...)` (contribute properties), `onEvent(...)` (observe)
 - **transport**: `apiRequest(path, init?)`
-- **server config**: `getRemoteConfig()` (current), `onRemoteConfig(...)` (changes)
-- **lifecycle**: `onNewSession(...)`
 - **registry**: `getExtension(token)`
 - **storage & logging**: `kv`, `logger`
 
-Synchronous members are always-ready in-memory reads; everything that does I/O
-or waits for readiness (`capture`, `apiRequest`, `kv`, `getRemoteConfig`) is
-asynchronous.
+### `CoreExtension`
+
+A conforming host must register one `CoreExtension` before setting up product
+extensions. Resolve it through `client.getExtension(CoreExtension)` for behavior
+owned by the PostHog client's analytics core:
+
+- **identity & session**: `distinctId`, `anonymousId`, `groups`, `session`
+- **events**: `capture(...)`, `registerDynamicEventProperties(...)`, `onEvent(...)`
+- **lifecycle**: `onNewSession(...)`
+- **server config**: `getRemoteConfig()` (current), `onRemoteConfig(...)` (changes)
+
+Identity and session are always-ready synchronous reads. Operations that perform
+I/O, including `capture`, `apiRequest`, `kv`, and `getRemoteConfig`, are
+awaitable.
 
 ### `Publisher`
 
@@ -127,7 +139,5 @@ v1 → `Client` porting map.
 ## Status
 
 Early and internal. The package currently defines the extension contract, the
-shared `Publisher` helper, and directly imported browser utilities under
-`utils/*` subpaths. Additional shared runtime helpers — key-value stores, the
-registry implementation, and a test `Client` — will land alongside the first
-ported extension.
+core analytics capability, shared runtime helpers, and directly imported browser
+utilities under `utils/*` subpaths.

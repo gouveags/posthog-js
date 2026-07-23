@@ -1007,28 +1007,15 @@ export class PostHog implements PostHogInterface {
     }
 
     _onRemoteConfig(result: RemoteConfigResult) {
-        // Cache and publish before waiting for the DOM. Shared extensions do not
-        // depend on document.body, and body retries must not emit the same result twice.
+        // Core state and the canonical result are available before shared callbacks,
+        // regardless of DOM readiness. DOM retries must not reapply or republish them.
         this._lastRemoteConfig = result
+        this._applyRemoteConfigCore(result)
         this._browserExtensionHost?.handleRemoteConfig(result)
-
         this._applyRemoteConfig(result)
     }
 
-    private _applyRemoteConfig(result: RemoteConfigResult): void {
-        if (!(document && document.body)) {
-            logger.info('document not ready yet, trying again in 500 milliseconds...')
-            setTimeout(() => {
-                this._applyRemoteConfig(result)
-            }, 500)
-            return
-        }
-
-        // Store config in case extensions aren't initialized yet (only needed for deferred init)
-        if (this.config.__preview_deferred_init_extensions) {
-            this._pendingRemoteConfig = result
-        }
-
+    private _applyRemoteConfigCore(result: RemoteConfigResult): void {
         this.compression = undefined
         if (result.ok) {
             const config = result.config
@@ -1052,8 +1039,23 @@ export class PostHog implements PostHogInterface {
                 ? this._initialPersonProfilesConfig
                 : PERSON_PROFILES_IDENTIFIED_ONLY,
         })
+    }
 
-        // Every extension receives the full result and handles the failure case itself.
+    private _applyRemoteConfig(result: RemoteConfigResult): void {
+        if (!(document && document.body)) {
+            logger.info('document not ready yet, trying again in 500 milliseconds...')
+            setTimeout(() => {
+                this._applyRemoteConfig(result)
+            }, 500)
+            return
+        }
+
+        // Store config in case extensions aren't initialized yet (only needed for deferred init)
+        if (this.config.__preview_deferred_init_extensions) {
+            this._pendingRemoteConfig = result
+        }
+
+        // Every legacy extension receives the canonical result and handles failures itself.
         this._extensions.forEach((ext) => ext.onRemoteConfig?.(result))
     }
 
@@ -3102,9 +3104,9 @@ export class PostHog implements PostHogInterface {
      * @remarks
      * This exists primarily for parity with the server-side
      * [Node.js SDK](/docs/libraries/node), whose `shutdown()` you call once before a
-     * process exits. In the browser there is no process to exit — the SDK already
-     * flushes pending events on `pagehide`/`unload` — so this method is mostly a
-     * graceful no-op that best-effort flushes the request queues and always resolves.
+     * process exits. In the browser there is no process to exit, but this method
+     * waits up to the configured timeout for shared extensions to dispose before it
+     * best-effort flushes the request queues and always resolves.
      *
      * It is safe to call in isomorphic teardown code (for example a Nuxt/Next module
      * that calls `shutdown()` on both the server and the client) so the same
@@ -3119,19 +3121,42 @@ export class PostHog implements PostHogInterface {
      *
      * @public
      *
-     * @param {number} [_shutdownTimeoutMs] Accepted for call-site parity with the Node.js SDK. The browser flush is synchronous, so this is ignored.
-     * @returns {Promise<void>} A promise that resolves once the queues have been flushed.
+     * @param {number} [shutdownTimeoutMs=30000] Maximum time to wait for shared extension teardown before queues are flushed.
+     * @returns {Promise<void>} A promise that resolves once best-effort teardown and queue flushing complete.
      */
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    async shutdown(_shutdownTimeoutMs?: number): Promise<void> {
+    async shutdown(shutdownTimeoutMs: number = 30000): Promise<void> {
         if (!this.__loaded) {
             logger.uninitializedWarning('posthog.shutdown')
             return
         }
 
         // Shared extensions can perform final async work during disposal. Complete
-        // that work before unloading the queues so any final captures can still send.
-        await this._browserExtensionHost?.dispose()
+        // within-budget work before unloading so final captures can still send, but
+        // never let an extension prevent the queues from being flushed.
+        const hostDisposal = this._browserExtensionHost?.dispose()
+        if (hostDisposal) {
+            await new Promise<void>((resolve) => {
+                let settled = false
+                const finish = (): void => {
+                    if (!settled) {
+                        settled = true
+                        clearTimeout(timer)
+                        resolve()
+                    }
+                }
+                const timer = setTimeout(
+                    () => {
+                        logger.warn(`Browser extension teardown timed out after ${shutdownTimeoutMs}ms`)
+                        finish()
+                    },
+                    Math.max(0, shutdownTimeoutMs)
+                )
+                hostDisposal.then(finish, (error) => {
+                    logger.error('Browser extension teardown failed', error)
+                    finish()
+                })
+            })
+        }
 
         // Best-effort flush of anything still queued, mirroring page-unload teardown
         // so no buffered events are silently dropped when teardown is explicit.
@@ -3946,6 +3971,7 @@ export class PostHog implements PostHogInterface {
             this.sessionManager?.destroy()
             this.pageViewManager?.destroy()
             this.sessionManager = new SessionIdManager(this)
+            this._browserExtensionHost?.rebindSessionSource()
             this.pageViewManager = new PageViewManager(this)
             if (this.persistence) {
                 this.sessionPropsManager = new SessionPropsManager(this, this.sessionManager, this.persistence)
